@@ -2,7 +2,7 @@
 
 MobileNetV3-Small remains CORA's official four-category classifier.
 This endpoint returns advisory image-text similarity scores, NOT reliable
-out-of-scope probabilities. Auto rejection defaults to OFF.
+out-of-scope probabilities. Auto rejection defaults to OFF until configured.
 """
 
 import io
@@ -116,7 +116,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="CORA ONNX OpenCLIP Verifier", version="2.0.0", lifespan=lifespan,
+    title="CORA ONNX OpenCLIP Verifier", version="2.1.0", lifespan=lifespan,
     # Keep the endpoint schema off the public internet; /verify requires a key.
     docs_url=None, redoc_url=None, openapi_url=None,
 )
@@ -168,33 +168,35 @@ async def verify(
     unrelated_exceeds_all_categories = unrelated_score > best_category_score
     unrelated_margin = unrelated_score - best_category_score
 
-    # Important: disagreement between two CORA categories is NOT an out-of-scope finding.
-    # For example, garbage in drainage may validly relate to both categories.
-    if unrelated_exceeds_all_categories:
-        verification_status = "out_of_scope_candidate"
-    elif not category_matches:
-        verification_status = "category_disagreement_needs_review"
-    else:
-        verification_status = "relevant_candidate"
-
-    if not AUTO_REJECT_ENABLED:
-        # All results remain advisory until calibrated on a labeled test set.
-        decision = "review_only"
-    else:
-        # Only reject when THREE calibrated conditions indicate unrelated content.
-        # Category disagreement alone is NEVER a reason to auto-reject.
+    # Relevance is checked against ALL FOUR CORA categories, not just the MobileNet label.
+    # A category disagreement (e.g., waste in a drainage canal) is never rejection
+    # evidence by itself. Compare the strongest CORA match against negative examples.
+    confirmed_ood = False
+    if AUTO_REJECT_ENABLED:
         confirmed_ood = (
             unrelated_exceeds_all_categories
             and unrelated_margin >= float(OOD_MIN_MARGIN)
             and best_category_score <= float(OOD_MAX_CATEGORY_SCORE)
             and unrelated_score >= float(OOD_MIN_UNRELATED_SCORE)
         )
-        if confirmed_ood:
-            decision = "rejected"
-        elif verification_status == "relevant_candidate":
-            decision = "accepted"
-        else:
-            decision = "needs_review"
+
+    if not AUTO_REJECT_ENABLED:
+        verification_status = (
+            "out_of_scope_candidate" if unrelated_exceeds_all_categories
+            else "in_scope_candidate"
+        )
+        decision = "review_only"
+    elif confirmed_ood:
+        verification_status = "out_of_scope"
+        decision = "rejected"
+    elif unrelated_exceeds_all_categories:
+        # Unclear relevance: don't falsely claim "out of scope" or approve it.
+        # No manual review workflow: ask for recapture instead.
+        verification_status = "uncertain"
+        decision = "recapture_required"
+    else:
+        verification_status = "in_scope"
+        decision = "accepted"
 
     return {
         "predicted_category": predicted_category,
@@ -204,11 +206,11 @@ async def verify(
         "unrelated_exceeds_all_categories": unrelated_exceeds_all_categories,
         "unrelated_margin_vs_best_category": round(unrelated_margin, 4),
         "verification_status": verification_status,
-        "needs_review": verification_status != "relevant_candidate",
+        "needs_review": decision in {"review_only", "recapture_required"},
         "predicted_category_similarity": round(supplied_score, 4),
         "highest_unrelated_similarity": round(unrelated_score, 4),
         "category_similarities": {name: round(float(value), 4) for name, value in zip(names, scores)},
         "decision": decision,
         "auto_reject_enabled": AUTO_REJECT_ENABLED,
-        "note": "Advisory similarity scores, NOT probabilities. Confirm thresholds with labeled data before enabling auto reject.",
+        "note": "Similarity scores are NOT probabilities. Verify false rejection/acceptance rates on real CORA test images.",
     }
