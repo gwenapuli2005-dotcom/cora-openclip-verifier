@@ -1,112 +1,112 @@
-"""CORA image-relevance checker, backed by OpenCLIP.
+"""CORA OpenCLIP image-relevance verifier, ONNX Runtime edition.
 
-This service does not replace MobileNetV3-Small and is not a trained out-of-scope
-classifier. Calibrate thresholds on labeled local CORA images before enabling
-automatic rejection.
+MobileNetV3-Small remains CORA's official four-category classifier.
+This endpoint returns advisory image-text similarity scores, NOT reliable
+out-of-scope probabilities. Auto rejection defaults to OFF.
 """
 
 import io
+import json
 import os
 import secrets
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated
 
-import open_clip
-import torch
+import numpy as np
+import onnxruntime as ort
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-MODEL_NAME = os.getenv("OPENCLIP_MODEL", "ViT-B-32")
-PRETRAINED = os.getenv("OPENCLIP_WEIGHTS", "laion2b_s34b_b79k")
+BASE = Path(__file__).resolve().parent
+MODEL_PATH = Path(os.getenv("MODEL_PATH", str(BASE / "models/openclip_vision_int8.onnx")))
+EMBEDDINGS_PATH = Path(os.getenv("EMBEDDINGS_PATH", str(BASE / "models/text_embeddings.json")))
 API_TOKEN = os.getenv("API_TOKEN", "")
 AUTO_REJECT_ENABLED = os.getenv("AUTO_REJECT_ENABLED", "false").lower() == "true"
 MIN_RELEVANCE_SCORE = os.getenv("MIN_RELEVANCE_SCORE")
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "6"))
-MAX_IMAGE_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-
-# This is an image-text *similarity* checker, not an image caption generator.
-CATEGORY_PROMPTS = {
-    "Improper Waste Disposal": [
-        "A photograph of household garbage illegally dumped on a roadside.",
-        "A photo showing piles of scattered trash and litter in a public area.",
-        "A picture of improperly discarded waste bags and rubbish outdoors.",
-    ],
-    "Streetlight Problem": [
-        "A photograph of a damaged streetlight mounted on a pole.",
-        "A public road streetlight with a visibly broken light fixture.",
-        "A street lamp that appears damaged and in need of repair.",
-    ],
-    "Drainage/Flooding Concern": [
-        "A photograph of a clogged roadside drainage canal.",
-        "A flooded street with standing water near drainage channels.",
-        "A photo showing a blocked gutter with water accumulation.",
-    ],
-    "Road Damage": [
-        "A photograph of a pothole on a road surface.",
-        "A concrete road with large visible cracks and damaged pavement.",
-        "An asphalt road with broken pavement and damaged surface.",
-    ],
-}
-
-# Representative negatives help with screening, but do NOT guarantee robust
-# open-set detection against arbitrary unrelated images.
-UNRELATED_PROMPTS = [
-    "A selfie portrait photograph of a person.",
-    "A close-up photograph of a plate of food.",
-    "A picture of a pet cat or dog indoors.",
-    "A photograph inside a clean bedroom or living room.",
-    "A screenshot of a phone app or a written document.",
-    "A photograph of a beautiful mountain or beach landscape.",
-]
+MAX_IMAGE_BYTES = int(os.getenv("MAX_UPLOAD_MB", "6")) * 1024 * 1024
+IMAGE_SIZE = 224
+CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 
 state = {}
 
 
-def _embed_texts(model, tokenizer, prompts):
-    tokens = tokenizer(prompts)
-    with torch.inference_mode():
-        features = model.encode_text(tokens)
-        return features / features.norm(dim=-1, keepdim=True)
+def _unit(vectors):
+    x = np.asarray(vectors, dtype=np.float32)
+    return x / np.maximum(np.linalg.norm(x, axis=-1, keepdims=True), 1e-12)
+
+
+def _preprocess(image):
+    # Match OpenCLIP ViT-B-32's RGB -> bicubic resize shortest side -> center crop.
+    image = image.convert("RGB")
+    width, height = image.size
+    if width <= height:
+        new_width = IMAGE_SIZE
+        new_height = max(IMAGE_SIZE, int(IMAGE_SIZE * height / width))
+    else:
+        new_height = IMAGE_SIZE
+        new_width = max(IMAGE_SIZE, int(IMAGE_SIZE * width / height))
+    image = image.resize((new_width, new_height), Image.Resampling.BICUBIC)
+    left = (new_width - IMAGE_SIZE) // 2
+    top = (new_height - IMAGE_SIZE) // 2
+    image = image.crop((left, top, left + IMAGE_SIZE, top + IMAGE_SIZE))
+    pixels = np.asarray(image, dtype=np.float32) / 255.0
+    pixels = (pixels - CLIP_MEAN) / CLIP_STD
+    return np.ascontiguousarray(pixels.transpose(2, 0, 1)[None, ...], dtype=np.float32)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not API_TOKEN:
-        raise RuntimeError("Set API_TOKEN in the Render environment first.")
+        raise RuntimeError("Set API_TOKEN in Render Environment first")
     if AUTO_REJECT_ENABLED and MIN_RELEVANCE_SCORE is None:
-        raise RuntimeError(
-            "Set a validated MIN_RELEVANCE_SCORE before AUTO_REJECT_ENABLED=true."
-        )
-    if MIN_RELEVANCE_SCORE is not None:
-        threshold = float(MIN_RELEVANCE_SCORE)
-        if not -1 <= threshold <= 1:
-            raise RuntimeError("MIN_RELEVANCE_SCORE must be between -1 and 1")
+        raise RuntimeError("Do not enable auto reject without a validated MIN_RELEVANCE_SCORE")
+    if MIN_RELEVANCE_SCORE is not None and not -1 <= float(MIN_RELEVANCE_SCORE) <= 1:
+        raise RuntimeError("MIN_RELEVANCE_SCORE must be between -1 and 1")
 
-    torch.set_num_threads(max(1, int(os.getenv("TORCH_NUM_THREADS", "2"))))
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        MODEL_NAME, pretrained=PRETRAINED, device="cpu"
-    )
-    model.eval()
-    tokenizer = open_clip.get_tokenizer(MODEL_NAME)
+    if not MODEL_PATH.is_file() or not EMBEDDINGS_PATH.is_file():
+        raise RuntimeError("Model files missing. Set MODEL_RELEASE_URL and run build.sh.")
 
-    category_vectors = []
-    for prompts in CATEGORY_PROMPTS.values():
-        prompt_vectors = _embed_texts(model, tokenizer, prompts)
-        averaged = prompt_vectors.mean(dim=0)
-        category_vectors.append(averaged / averaged.norm())
+    with EMBEDDINGS_PATH.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    categories = payload["categories"]
+    # The JSON is produced by export_onnx.py from the exact original prompts.
+    names = list(categories)
+    if names != [
+        "Improper Waste Disposal", "Streetlight Problem",
+        "Drainage/Flooding Concern", "Road Damage",
+    ]:
+        raise RuntimeError("Category order in text_embeddings.json is unexpected")
+    category_vectors = _unit([categories[name] for name in names])
+    unrelated_vectors = _unit(payload["unrelated"])
+    if category_vectors.shape[1] != unrelated_vectors.shape[1]:
+        raise RuntimeError("Text embedding dimensions differ")
 
-    state.update({
-        "model": model,
-        "preprocess": preprocess,
-        "categories": list(CATEGORY_PROMPTS.keys()),
-        "category_vectors": torch.stack(category_vectors),
-        "unrelated_vectors": _embed_texts(model, tokenizer, UNRELATED_PROMPTS),
-    })
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = max(1, int(os.getenv("ORT_THREADS", "1")))
+    options.inter_op_num_threads = 1
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.enable_cpu_mem_arena = False  # Lower peak memory, at a performance cost
+    options.enable_mem_pattern = False
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    session = ort.InferenceSession(str(MODEL_PATH), sess_options=options, providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+    # Use one image per request to avoid memory spikes on 512 MB instances.
+    output_shape = session.get_outputs()[0].shape
+    if isinstance(output_shape[-1], int) and output_shape[-1] != category_vectors.shape[1]:
+        raise RuntimeError("ONNX output and text embedding dimensions differ")
+    state.update(session=session, input_name=input_name, categories=names,
+                 category_vectors=category_vectors, unrelated_vectors=unrelated_vectors)
     yield
     state.clear()
 
 
-app = FastAPI(title="CORA OpenCLIP verifier", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="CORA ONNX OpenCLIP Verifier", version="2.0.0", lifespan=lifespan,
+    # Keep the endpoint schema off the public internet; /verify requires a key.
+    docs_url=None, redoc_url=None, openapi_url=None,
+)
 
 
 @app.get("/health")
@@ -116,57 +116,47 @@ def health():
 
 @app.post("/verify")
 async def verify(
-    file: Annotated[UploadFile, File(description="Camera image or testing image")],
-    predicted_category: Annotated[str, Form(description="Actual MobileNet predicted label")],
+    file: Annotated[UploadFile, File(description="Resident camera or authorized test image")],
+    predicted_category: Annotated[str, Form(description="Actual MobileNetV3-Small prediction")],
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
 ):
-    if not x_api_key or not secrets.compare_digest(x_api_key, API_TOKEN):
+    if not x_api_key or not API_TOKEN or not secrets.compare_digest(x_api_key, API_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    if predicted_category not in CATEGORY_PROMPTS:
+    if not state:
+        raise HTTPException(status_code=503, detail="Model is not ready")
+    if predicted_category not in state["categories"]:
         raise HTTPException(status_code=422, detail="Unknown CORA category")
     if file.content_type not in {"image/jpeg", "image/png", "image/webp"}:
-        raise HTTPException(status_code=415, detail="Only JPG, PNG, or WEBP images supported")
-
+        raise HTTPException(status_code=415, detail="Only JPG, PNG, and WEBP images supported")
     raw = await file.read(MAX_IMAGE_BYTES + 1)
     if len(raw) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=413, detail="Image file is too large")
-
+        raise HTTPException(status_code=413, detail="Image exceeds the upload size limit")
     try:
-        with Image.open(io.BytesIO(raw)) as source:
-            if source.width * source.height > 15_000_000:
+        with Image.open(io.BytesIO(raw)) as src:
+            if src.width * src.height > 15_000_000:
                 raise HTTPException(status_code=413, detail="Image resolution too large")
-            image = ImageOps.exif_transpose(source).convert("RGB")
+            image = ImageOps.exif_transpose(src).convert("RGB")
     except (UnidentifiedImageError, OSError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid image file") from None
 
-    tensor = state["preprocess"](image).unsqueeze(0)
-    with torch.inference_mode():
-        image_features = state["model"].encode_image(tensor)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        category_scores = (image_features @ state["category_vectors"].T)[0]
-        unrelated_scores = (image_features @ state["unrelated_vectors"].T)[0]
+    tensor = _preprocess(image)
+    features = state["session"].run(None, {state["input_name"]: tensor})[0]
+    features = _unit(features)[0]
+    scores = state["category_vectors"] @ features
+    unrelated_scores = state["unrelated_vectors"] @ features
 
     names = state["categories"]
-    score_map = {name: round(float(category_scores[i]), 4) for i, name in enumerate(names)}
-    best_index = int(torch.argmax(category_scores))
-    best_category = names[best_index]
-    supplied_score = float(category_scores[names.index(predicted_category)])
-    unrelated_score = float(torch.max(unrelated_scores))
-    category_matches = (best_category == predicted_category)
-    unrelated_competes = (unrelated_score >= supplied_score)
-    needs_review = not category_matches or unrelated_competes
+    best_category = names[int(np.argmax(scores))]
+    supplied_score = float(scores[names.index(predicted_category)])
+    unrelated_score = float(np.max(unrelated_scores))
+    category_matches = best_category == predicted_category
+    unrelated_competes = unrelated_score >= supplied_score
+    needs_review = (not category_matches) or unrelated_competes
 
-    # Advisory mode is the safe default. Do not equate similarity with calibrated
-    # probability or silently use an arbitrary auto-rejection threshold.
     if not AUTO_REJECT_ENABLED:
         decision = "review_only"
     else:
-        threshold = float(MIN_RELEVANCE_SCORE)
-        decision = (
-            "rejected"
-            if needs_review or supplied_score < threshold
-            else "accepted"
-        )
+        decision = "rejected" if needs_review or supplied_score < float(MIN_RELEVANCE_SCORE) else "accepted"
 
     return {
         "predicted_category": predicted_category,
@@ -175,8 +165,8 @@ async def verify(
         "unrelated_example_competes": unrelated_competes,
         "predicted_category_similarity": round(supplied_score, 4),
         "highest_unrelated_similarity": round(unrelated_score, 4),
-        "category_similarities": score_map,
+        "category_similarities": {name: round(float(value), 4) for name, value in zip(names, scores)},
         "decision": decision,
         "auto_reject_enabled": AUTO_REJECT_ENABLED,
-        "note": "Similarity scores are NOT confidence probabilities. Validate thresholds on local data.",
+        "note": "Similarity scores are NOT probabilities; calibrate before automatic rejection.",
     }
