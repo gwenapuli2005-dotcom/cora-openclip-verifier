@@ -23,7 +23,10 @@ MODEL_PATH = Path(os.getenv("MODEL_PATH", str(BASE / "models/openclip_vision_int
 EMBEDDINGS_PATH = Path(os.getenv("EMBEDDINGS_PATH", str(BASE / "models/text_embeddings.json")))
 API_TOKEN = os.getenv("API_TOKEN", "")
 AUTO_REJECT_ENABLED = os.getenv("AUTO_REJECT_ENABLED", "false").lower() == "true"
-MIN_RELEVANCE_SCORE = os.getenv("MIN_RELEVANCE_SCORE")
+# Calibrate these on labeled in-scope and out-of-scope images BEFORE auto rejection.
+OOD_MIN_MARGIN = os.getenv("OOD_MIN_MARGIN")
+OOD_MAX_CATEGORY_SCORE = os.getenv("OOD_MAX_CATEGORY_SCORE")
+OOD_MIN_UNRELATED_SCORE = os.getenv("OOD_MIN_UNRELATED_SCORE")
 MAX_IMAGE_BYTES = int(os.getenv("MAX_UPLOAD_MB", "6")) * 1024 * 1024
 IMAGE_SIZE = 224
 CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
@@ -60,10 +63,20 @@ def _preprocess(image):
 async def lifespan(app: FastAPI):
     if not API_TOKEN:
         raise RuntimeError("Set API_TOKEN in Render Environment first")
-    if AUTO_REJECT_ENABLED and MIN_RELEVANCE_SCORE is None:
-        raise RuntimeError("Do not enable auto reject without a validated MIN_RELEVANCE_SCORE")
-    if MIN_RELEVANCE_SCORE is not None and not -1 <= float(MIN_RELEVANCE_SCORE) <= 1:
-        raise RuntimeError("MIN_RELEVANCE_SCORE must be between -1 and 1")
+    if AUTO_REJECT_ENABLED:
+        required = [OOD_MIN_MARGIN, OOD_MAX_CATEGORY_SCORE, OOD_MIN_UNRELATED_SCORE]
+        if any(value is None for value in required):
+            raise RuntimeError(
+                "Do not enable auto reject without calibrated OOD_MIN_MARGIN, "
+                "OOD_MAX_CATEGORY_SCORE, and OOD_MIN_UNRELATED_SCORE"
+            )
+    for name, value in (
+        ("OOD_MIN_MARGIN", OOD_MIN_MARGIN),
+        ("OOD_MAX_CATEGORY_SCORE", OOD_MAX_CATEGORY_SCORE),
+        ("OOD_MIN_UNRELATED_SCORE", OOD_MIN_UNRELATED_SCORE),
+    ):
+        if value is not None and not -1.0 <= float(value) <= 1.0:
+            raise RuntimeError(f"{name} must be between -1 and 1")
 
     if not MODEL_PATH.is_file() or not EMBEDDINGS_PATH.is_file():
         raise RuntimeError("Model files missing. Set MODEL_RELEASE_URL and run build.sh.")
@@ -150,23 +163,52 @@ async def verify(
     supplied_score = float(scores[names.index(predicted_category)])
     unrelated_score = float(np.max(unrelated_scores))
     category_matches = best_category == predicted_category
-    unrelated_competes = unrelated_score >= supplied_score
-    needs_review = (not category_matches) or unrelated_competes
+    best_category_score = float(np.max(scores))
+    unrelated_competes = unrelated_score >= supplied_score  # backward-compatible legacy field
+    unrelated_exceeds_all_categories = unrelated_score > best_category_score
+    unrelated_margin = unrelated_score - best_category_score
+
+    # Important: disagreement between two CORA categories is NOT an out-of-scope finding.
+    # For example, garbage in drainage may validly relate to both categories.
+    if unrelated_exceeds_all_categories:
+        verification_status = "out_of_scope_candidate"
+    elif not category_matches:
+        verification_status = "category_disagreement_needs_review"
+    else:
+        verification_status = "relevant_candidate"
 
     if not AUTO_REJECT_ENABLED:
+        # All results remain advisory until calibrated on a labeled test set.
         decision = "review_only"
     else:
-        decision = "rejected" if needs_review or supplied_score < float(MIN_RELEVANCE_SCORE) else "accepted"
+        # Only reject when THREE calibrated conditions indicate unrelated content.
+        # Category disagreement alone is NEVER a reason to auto-reject.
+        confirmed_ood = (
+            unrelated_exceeds_all_categories
+            and unrelated_margin >= float(OOD_MIN_MARGIN)
+            and best_category_score <= float(OOD_MAX_CATEGORY_SCORE)
+            and unrelated_score >= float(OOD_MIN_UNRELATED_SCORE)
+        )
+        if confirmed_ood:
+            decision = "rejected"
+        elif verification_status == "relevant_candidate":
+            decision = "accepted"
+        else:
+            decision = "needs_review"
 
     return {
         "predicted_category": predicted_category,
         "openclip_best_category": best_category,
         "category_matches": category_matches,
         "unrelated_example_competes": unrelated_competes,
+        "unrelated_exceeds_all_categories": unrelated_exceeds_all_categories,
+        "unrelated_margin_vs_best_category": round(unrelated_margin, 4),
+        "verification_status": verification_status,
+        "needs_review": verification_status != "relevant_candidate",
         "predicted_category_similarity": round(supplied_score, 4),
         "highest_unrelated_similarity": round(unrelated_score, 4),
         "category_similarities": {name: round(float(value), 4) for name, value in zip(names, scores)},
         "decision": decision,
         "auto_reject_enabled": AUTO_REJECT_ENABLED,
-        "note": "Similarity scores are NOT probabilities; calibrate before automatic rejection.",
+        "note": "Advisory similarity scores, NOT probabilities. Confirm thresholds with labeled data before enabling auto reject.",
     }
